@@ -1,0 +1,600 @@
+/***** CONFIG *****/
+var CONFIG = {
+  TARGET_SPREADSHEET_ID: "",
+
+  // Master tab (Form 1 writes here)
+  MASTER_SHEET_NAME: "SDM Intake Form",
+
+  // Header aliases on MASTER
+  PROJECT_HEADER_ALIASES: ["Project Name","Project name","Project","Project Name:"],
+  MASTER_STATUS_HEADER_ALIASES: ["Status","Project Status"],
+  MASTER_CONTRIB_HEADER_ALIASES: ["Project Contributors","Current Project Contributors","Contributors","Project Contributor(s)"],
+  LAST_UPDATED_HEADER_ALIASES: ["Last updated","Last Updated","Updated at","Updated At"],
+  INTAKE_KEY_HEADER: "Intake Key",
+
+  // ===== Form #1 (create project) =====
+  INTAKE_RESPONSE_SHEET_NAME: "SDM Intake Form",
+  NEW_PROJECT_INITIAL_STATUS: "Initiation",
+
+  // ===== Form #2 (update status) =====
+  STATUS_RESPONSE_SHEET_NAME: "Projects",
+  STATUS_FORM_ID: "1GczbCzgYmKRsqlOGbW7W7Fq9dYdVIimJx3STKG2rs7M",
+  STATUS_FORM_PROJECT_ITEM_TITLE: "Project Name",
+  STATUS_FORM_STATUS_QUESTION: "Status",
+
+  // Robust parsing of Form 2 (add as many variants as you need)
+  STATUS_PROJECT_ALIASES: ["Project Name","Project name","Project","Select Project","Select Project Name","Project Name:"],
+  STATUS_STATUS_ALIASES: [
+    "Status","Project Status","New Status",
+    "Status of the project","Select Status","Project current Status","Updated Status"
+  ],
+
+  // Contributors field in Form 2 (your exact prompt + variants/typos)
+  STATUS_CONTRIB_ALIASES: [
+    "Please add Contributors name when In Progress is selected",
+    "Please add Contributors name when In Progess is selcted in the Status of the form",
+    "Please add Contributors name when In Progess is selected",
+    "Please add Contributors name",
+    "Contributors","Project Contributors","Current Project Contributors"
+  ],
+
+  // Allowed statuses (include common typo)
+  ALLOWED_STATUS_VALUES: [
+    "Initiation","New","Needs Info","Backlog","In Review",
+    "Approved","Rejected","In Progress","In Progess","Blocked","Completed","On Hold","Done"
+  ],
+
+  // Email (Form 1)
+  MANAGER_EMAILS: ["mark_marella@intuit.com","milind_khandagale@intuit.com"],
+  EMAIL_SUBJECT_PREFIX: "New Project Submitted:",
+  SENDER_NAME: "Project Intake",
+  DEBUG_SEND_TO_ME: false,
+
+  // Hide duplicates in the email compact dump
+  EMAIL_EXCLUDE_HEADERS: [
+    "Status", "Project Status",
+    "Timestamp", "Submission Time",
+    "Intake Key",
+    "Owner",
+    "Project Owner",
+    "Description",
+    "Project Description",
+    "Project Description:",
+    "Project Name",
+    "Project Name:"
+  ],
+
+  // Contributors merge behavior
+  CONTRIBUTORS_JOIN_DELIMITER: ", ",
+  CONTRIBUTORS_DEDUP: true,
+
+  // Optional nightly sync hour
+  SYNC_AT_HOUR: 3,
+
+  // Logs
+  ENABLE_SHEET_LOGS: true,
+  LOG_SHEET_NAME: "Logs"
+};
+
+/* ===== Triggers =====
+   REQUIRED: onFormSubmit → From spreadsheet → On form submit
+   OPTIONAL: onProjectsEdit → From spreadsheet → On edit
+======================*/
+
+function onFormSubmit(e) {
+  try {
+    var sh = e && e.range ? e.range.getSheet() : null;
+    var sheetName = sh ? sh.getName() : "";
+    var named = e && e.namedValues ? e.namedValues : {};
+
+    if (sheetName === CONFIG.INTAKE_RESPONSE_SHEET_NAME) { onIntakeSubmit(e); return; }
+    if (sheetName === CONFIG.STATUS_RESPONSE_SHEET_NAME) { onStatusSubmit(e); return; }
+
+    // Fallback by fields if tabs were renamed
+    if (named && (named[CONFIG.STATUS_FORM_PROJECT_ITEM_TITLE] || named[CONFIG.STATUS_FORM_STATUS_QUESTION])) { onStatusSubmit(e); return; }
+    if (named && (named["Project Name"] || named["Project Description"] || named["Project Description:"])) { onIntakeSubmit(e); return; }
+
+    log_("INFO","Dispatcher: no match (sheet=" + sheetName + ")");
+  } catch (err) {
+    log_("ERROR","Dispatcher error: " + err);
+  }
+}
+
+/* ============ FORM 1: INTAKE (writes inline to MASTER) ============ */
+function onIntakeSubmit(e) {
+  try {
+    var eventSheet = e && e.range ? e.range.getSheet() : null;
+    if (!eventSheet || eventSheet.getName() !== CONFIG.INTAKE_RESPONSE_SHEET_NAME) return;
+
+    // Keep run-once for intake to prevent duplicate new rows
+    if (!shouldProcessEventOnce_(e,"intake")) { log_("WARN","Intake duplicate — skipped."); return; }
+
+    var ss = getSpreadsheet_(e);
+    var master = ss.getSheetByName(CONFIG.MASTER_SHEET_NAME);
+    if (!master) throw new Error('Master sheet "' + CONFIG.MASTER_SHEET_NAME + '" not found');
+
+    var rowNum = e.range.getRow();
+    var headers = master.getRange(1,1,1,master.getLastColumn()).getValues()[0] || [];
+
+    var idxIntakeKey = getOrCreateHeaderIndex_(master, CONFIG.INTAKE_KEY_HEADER);
+    headers = master.getRange(1,1,1,master.getLastColumn()).getValues()[0] || [];
+
+    var idxProject = findHeaderIndex_(headers, CONFIG.PROJECT_HEADER_ALIASES);
+    var idxStatus  = findHeaderIndex_(headers, CONFIG.MASTER_STATUS_HEADER_ALIASES);
+    var idxUpdated = findHeaderIndex_(headers, CONFIG.LAST_UPDATED_HEADER_ALIASES);
+
+    if (String(master.getRange(rowNum, idxIntakeKey + 1).getValue() || "")) {
+      log_("WARN","Intake: key already present row " + rowNum + " — skip.");
+      return;
+    }
+
+    var intakeKey = computeEventKey_(e,"intake");
+    master.getRange(rowNum, idxIntakeKey + 1).setValue(intakeKey);
+
+    if (idxStatus !== -1) master.getRange(rowNum, idxStatus + 1).setValue(CONFIG.NEW_PROJECT_INITIAL_STATUS);
+    if (idxUpdated !== -1) master.getRange(rowNum, idxUpdated + 1).setValue(new Date());
+
+    var rowValues = master.getRange(rowNum, 1, 1, master.getLastColumn()).getValues()[0] || [];
+    var projectName = (idxProject !== -1) ? String(rowValues[idxProject] || "").trim() : "(Unknown Project)";
+
+    // Sync Form 2 dropdown now
+    try { syncStatusFormProjectDropdown(); } catch (errSync) { log_("WARN","Post-intake sync failed: " + errSync); }
+
+    // Email managers (inline labels for Name/Description)
+    var recipients = CONFIG.DEBUG_SEND_TO_ME ? [Session.getActiveUser().getEmail()] : CONFIG.MANAGER_EMAILS.slice();
+    if (recipients.length) {
+      var subject = CONFIG.EMAIL_SUBJECT_PREFIX + " " + projectName;
+      var projectOwner = tryReadByHeader_(headers, rowValues, ["Project Owner"]);
+      var desc  = tryReadByHeader_(headers, rowValues, ["Project Description","Project Description:","Description"]);
+      var html  = buildIntakeEmailHtml_(projectName, CONFIG.NEW_PROJECT_INITIAL_STATUS, projectOwner, desc, headers, rowValues);
+
+      var text  = "New project submitted: " + projectName + "\n"
+                + "Project Name: " + (projectName || "") + "\n"
+                + "Project Owner: " + (projectOwner || "") + "\n"
+                + "Status: " + CONFIG.NEW_PROJECT_INITIAL_STATUS + "\n"
+                + "Project Description: " + (desc || "");
+
+      MailApp.sendEmail({ to: recipients.join(","), subject: subject, body: text, htmlBody: html, name: CONFIG.SENDER_NAME, noReply: true });
+      log_("INFO","Intake email sent to: " + recipients.join(","));
+    }
+  } catch (err) {
+    log_("ERROR","onIntakeSubmit: " + err);
+  }
+}
+
+/* ============ FORM 2: STATUS/CONTRIBUTORS ============ */
+/* NOTE: No run-once guard here, to ensure every submission is processed */
+function onStatusSubmit(e) {
+  try {
+    var eventSheet = (e && e.range) ? e.range.getSheet() : null;
+    if (!eventSheet || eventSheet.getName() !== CONFIG.STATUS_RESPONSE_SHEET_NAME) return;
+
+    var named = (e && e.namedValues) ? e.namedValues : {};
+    var ss = getSpreadsheet_(e);
+    var master = ss.getSheetByName(CONFIG.MASTER_SHEET_NAME);
+    if (!master) throw new Error('Master sheet "' + CONFIG.MASTER_SHEET_NAME + '" not found');
+
+    // Build set of valid project names from MASTER (needed for heuristics)
+    var projectSet = getMasterProjectSet_();
+
+    // Robust read of project + status from the submission
+    var got = readSubmissionProjectStatus_(e, named, projectSet);
+    var project = got.project;
+    var status  = got.status;
+    var contributors = readSubmissionContributorsSmart_(e, named);
+
+    if (!project) { log_("WARN","Status: Project Name missing — saw keys: " + Object.keys(named).join(", ")); return; }
+
+    var changed = 0;
+
+    // Update status if provided
+    if (status) {
+      changed += updateMasterStatusByProjectName_(project, status, { writeTimestamp: true });
+    }
+
+    // Gate to append contributors:
+    // - If status provided & is In Progress/Progess
+    // - OR if no status provided but CURRENT master status is In Progress/Progess
+    var allowContrib = false;
+    var sNorm = normalize_(status || "", true);
+    if (sNorm === "in progress" || sNorm === "in-progress" || sNorm === "in progess" || sNorm === "inprogess") {
+      allowContrib = true;
+    } else if (!status) {
+      var current = getCurrentStatusByProjectName_(project);
+      var cNorm = normalize_(current || "", true);
+      if (cNorm === "in progress" || cNorm === "in-progress" || cNorm === "in progess" || cNorm === "inprogess") {
+        allowContrib = true;
+      }
+    }
+
+    if (contributors && allowContrib) {
+      changed += mergeMasterContribByProjectName_(project, contributors, { writeTimestamp: true });
+    } else if (contributors && !allowContrib) {
+      log_("INFO",'Status: contributors provided but status gate not met (status="' + (status || "(unchanged)") + '").');
+    }
+
+    if (changed) {
+      log_("INFO",'Status: updated "' + project + '"'
+        + (status ? (" -> " + status) : "")
+        + (contributors && allowContrib ? "; contributors merged" : "")
+        + " (source='status submit')");
+    } else {
+      log_("WARN",'Status: no changes for "' + project + '". If mismatch, run syncStatusFormProjectDropdown().');
+    }
+  } catch (err) {
+    log_("ERROR","onStatusSubmit: " + String(err));
+  }
+}
+
+/* OPTIONAL: process edits to the “Projects” responses sheet too */
+function onProjectsEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    var sh = e.range.getSheet();
+    if (sh.getName() !== CONFIG.STATUS_RESPONSE_SHEET_NAME) return;
+    onStatusSubmit({ range: e.range, source: e.source, namedValues: {} });
+  } catch (err) {
+    log_("WARN","onProjectsEdit: " + err);
+  }
+}
+
+/* ===== MASTER updates ===== */
+function updateMasterStatusByProjectName_(projectName, newStatus, options) {
+  if (!newStatus) return 0;
+  var sh = getSpreadsheet_().getSheetByName(CONFIG.MASTER_SHEET_NAME);
+  var lastRow = sh.getLastRow(); if (lastRow < 2) return 0;
+
+  var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] || [];
+  var idxProject = findHeaderIndex_(headers, CONFIG.PROJECT_HEADER_ALIASES);
+  var idxStatus  = findHeaderIndex_(headers, CONFIG.MASTER_STATUS_HEADER_ALIASES);
+  var idxUpdated = findHeaderIndex_(headers, CONFIG.LAST_UPDATED_HEADER_ALIASES);
+  if (idxProject === -1 || idxStatus === -1) throw new Error("Missing Project/Status headers on master");
+
+  var range = sh.getRange(2, idxProject + 1, lastRow - 1, 1).getValues();
+  var target = normalize_(projectName, true);
+
+  for (var i = 0; i < range.length; i++) {
+    if (normalize_(String(range[i][0] || ""), true) === target) {
+      var rowNum = 2 + i;
+      sh.getRange(rowNum, idxStatus + 1).setValue(newStatus);
+      if (idxUpdated !== -1 && options && options.writeTimestamp) sh.getRange(rowNum, idxUpdated + 1).setValue(new Date());
+      return 1;
+    }
+  }
+  return 0;
+}
+
+function mergeMasterContribByProjectName_(projectName, newContribText, options) {
+  if (!newContribText) return 0;
+  var sh = getSpreadsheet_().getSheetByName(CONFIG.MASTER_SHEET_NAME);
+  var lastRow = sh.getLastRow(); if (lastRow < 2) return 0;
+
+  var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] || [];
+  var idxProject = findHeaderIndex_(headers, CONFIG.PROJECT_HEADER_ALIASES);
+  var idxContrib = findHeaderIndex_(headers, CONFIG.MASTER_CONTRIB_HEADER_ALIASES);
+  var idxUpdated = findHeaderIndex_(headers, CONFIG.LAST_UPDATED_HEADER_ALIASES);
+  if (idxProject === -1) throw new Error("Missing Project header on master");
+  if (idxContrib === -1) { idxContrib = getOrCreateHeaderIndex_(sh, CONFIG.MASTER_CONTRIB_HEADER_ALIASES[0]); headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] || []; }
+
+  var projRange = sh.getRange(2, idxProject + 1, lastRow - 1, 1).getValues();
+  var target = normalize_(projectName, true);
+
+  for (var i = 0; i < projRange.length; i++) {
+    if (normalize_(String(projRange[i][0] || ""), true) === target) {
+      var rowNum = 2 + i;
+      var existing = String(sh.getRange(rowNum, idxContrib + 1).getValue() || "");
+      var merged = mergeContributors_(existing, newContribText);
+      if (merged !== existing) {
+        sh.getRange(rowNum, idxContrib + 1).setValue(merged);
+        if (idxUpdated !== -1 && options && options.writeTimestamp) sh.getRange(rowNum, idxUpdated + 1).setValue(new Date());
+        return 1;
+      }
+      log_("INFO","Contributors unchanged (all names already present).");
+      return 0;
+    }
+  }
+  return 0;
+}
+
+/* ===== Read current status for a project (used when Form 2 doesn’t include Status) ===== */
+function getCurrentStatusByProjectName_(projectName) {
+  var sh = getSpreadsheet_().getSheetByName(CONFIG.MASTER_SHEET_NAME);
+  var lastRow = sh.getLastRow(); if (lastRow < 2) return "";
+  var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] || [];
+  var idxProject = findHeaderIndex_(headers, CONFIG.PROJECT_HEADER_ALIASES);
+  var idxStatus  = findHeaderIndex_(headers, CONFIG.MASTER_STATUS_HEADER_ALIASES);
+  if (idxProject === -1 || idxStatus === -1) return "";
+  var range = sh.getRange(2, 1, lastRow - 1, sh.getLastColumn()).getValues();
+  var target = normalize_(projectName, true);
+  for (var i = 0; i < range.length; i++) {
+    if (normalize_(String(range[i][idxProject] || ""), true) === target) {
+      return String(range[i][idxStatus] || "");
+    }
+  }
+  return "";
+}
+
+/* ===== Build set of valid project names from MASTER (for heuristics) ===== */
+function getMasterProjectSet_() {
+  var sh = getSpreadsheet_().getSheetByName(CONFIG.MASTER_SHEET_NAME);
+  var set = {};
+  if (!sh) return set;
+
+  var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] || [];
+  var idxProject = findHeaderIndex_(headers, CONFIG.PROJECT_HEADER_ALIASES);
+  if (idxProject === -1) return set;
+
+  var last = sh.getLastRow();
+  if (last < 2) return set;
+
+  var vals = sh.getRange(2, idxProject + 1, last - 1, 1).getValues();
+  for (var i = 0; i < vals.length; i++) {
+    var v = normalize_(vals[i][0], true);
+    if (v) set[v] = true;
+  }
+  return set;
+}
+
+/* ===== Sync Form 2 dropdown from MASTER ===== */
+function syncStatusFormProjectDropdown() {
+  var ss = getSpreadsheet_();
+  var sh = ss.getSheetByName(CONFIG.MASTER_SHEET_NAME);
+  if (!sh) throw new Error('Master sheet not found: ' + CONFIG.MASTER_SHEET_NAME);
+
+  var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] || [];
+  var idxProject = findHeaderIndex_(headers, CONFIG.PROJECT_HEADER_ALIASES);
+  if (idxProject === -1) throw new Error("Project header not found");
+
+  var last = sh.getLastRow();
+  if (last < 2) return;
+
+  var values = sh.getRange(2, idxProject + 1, last - 1, 1).getValues()
+                 .map(function(r){ return String(r[0] || "").trim(); })
+                 .filter(function(v){ return !!v; });
+
+  // de-dupe + sort
+  var seen = {}, arr = [];
+  for (var i = 0; i < values.length; i++) { var v = values[i]; if (!seen[v]) { seen[v] = true; arr.push(v); } }
+  arr.sort(function(a,b){ return a.localeCompare(b); });
+
+  var form = FormApp.openById(CONFIG.STATUS_FORM_ID);
+  var items = form.getItems().filter(function(i){ return i.getTitle() === CONFIG.STATUS_FORM_PROJECT_ITEM_TITLE; });
+  if (!items.length) throw new Error('Form item not found: ' + CONFIG.STATUS_FORM_PROJECT_ITEM_TITLE);
+
+  items.forEach(function(item){
+    var t = item.getType();
+    if (t === FormApp.ItemType.LIST) item.asListItem().setChoiceValues(arr);
+    else if (t === FormApp.ItemType.MULTIPLE_CHOICE) item.asMultipleChoiceItem().setChoiceValues(arr);
+    else throw new Error("Project item must be Dropdown or Multiple choice.");
+  });
+
+  log_("INFO","Synced status form dropdown with " + arr.length + " project(s).");
+}
+
+/* ===== Nightly sync trigger (optional) ===== */
+function createDailySyncTrigger() {
+  ScriptApp.newTrigger("syncStatusFormProjectDropdown").timeBased().atHour(CONFIG.SYNC_AT_HOUR || 3).everyDays(1).create();
+}
+
+/* ================= Helpers ================= */
+function getFromNamedValues_(named, aliases) {
+  if (!named) return "";
+  // exact first
+  for (var i = 0; i < aliases.length; i++) {
+    var v = named[aliases[i]];
+    if (v && v.length && String(v[0]).trim() !== "") return String(v[0]).trim();
+  }
+  // case-insensitive fallback
+  var norm = {};
+  for (var k in named) if (named.hasOwnProperty(k)) {
+    var arr = named[k]; var val = (arr && arr.length) ? String(arr[0]).trim() : "";
+    if (val) norm[String(k).trim().toLowerCase()] = val;
+  }
+  for (var j = 0; j < aliases.length; j++) {
+    var want = String(aliases[j]).trim().toLowerCase();
+    if (norm.hasOwnProperty(want)) return norm[want];
+  }
+  return "";
+}
+
+function getFromEventSheetRow_(e, headerAliases) {
+  try {
+    if (!e || !e.range) return "";
+    var sh = e.range.getSheet();
+    var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0] || [];
+    var idx = findHeaderIndex_(headers, headerAliases);
+    if (idx === -1) return "";
+    return String(sh.getRange(e.range.getRow(), idx + 1).getValue() || "").trim();
+  } catch (_) { return ""; }
+}
+
+function tryReadByHeader_(headers, rowValues, aliases) {
+  var i = findHeaderIndex_(headers, aliases);
+  return i === -1 ? "" : String(rowValues[i] || "").trim();
+}
+
+function readSubmissionProjectStatus_(e, named, masterProjectSet) {
+  var source = "named-alias";
+  var project = getFromNamedValues_(named, (CONFIG.STATUS_PROJECT_ALIASES || []).concat([CONFIG.STATUS_FORM_PROJECT_ITEM_TITLE]));
+  var status  = getFromNamedValues_(named, (CONFIG.STATUS_STATUS_ALIASES  || []).concat([CONFIG.STATUS_FORM_STATUS_QUESTION]));
+  if (project && status) return { project: project, status: status, source: source };
+
+  source = "row-headers";
+  if (!project) project = getFromEventSheetRow_(e, (CONFIG.STATUS_PROJECT_ALIASES || []).concat([CONFIG.STATUS_FORM_PROJECT_ITEM_TITLE]));
+  if (!status)  status  = getFromEventSheetRow_(e, (CONFIG.STATUS_STATUS_ALIASES  || []).concat([CONFIG.STATUS_FORM_STATUS_QUESTION]));
+  if (project && status) return { project: project, status: status, source: source };
+
+  source = "heuristic";
+  try {
+    var sh = e.range.getSheet();
+    var rowNum = e.range.getRow();
+    var lastCol = sh.getLastColumn();
+    var headers = sh.getRange(1,1,1,lastCol).getValues()[0] || [];
+    var rowVals = sh.getRange(rowNum, 1, 1, lastCol).getValues()[0] || [];
+    var tsIdx = findHeaderIndex_(headers, ["Timestamp","Submission Time"]);
+
+    var allowed = (CONFIG.ALLOWED_STATUS_VALUES || []).map(function(s){ return normalize_(s, true); });
+    var allowedSet = {}; for (var a = 0; a < allowed.length; a++) allowedSet[allowed[a]] = true;
+
+    var guessProject = "", guessStatus  = "";
+
+    for (var c = 0; c < rowVals.length; c++) {
+      if (c === tsIdx) continue;
+      var cell = String(rowVals[c] == null ? "" : rowVals[c]).trim();
+      if (!cell) continue;
+      var cellN = normalize_(cell, true);
+
+      if (!guessProject && masterProjectSet[cellN]) { guessProject = cell; continue; }
+      if (!guessStatus  && allowedSet[cellN])      { guessStatus  = cell; }
+    }
+    if (guessProject || guessStatus) return { project: project || guessProject, status: status || guessStatus, source: source };
+  } catch (_) {}
+
+  return { project: project || "", status: status || "", source: source };
+}
+
+/* SMART contributors extractor:
+   1) Try aliases.
+   2) If blank, choose the longest non-empty field that is NOT project/status/timestamp/email. */
+function readSubmissionContributorsSmart_(e, named) {
+  var val = getFromNamedValues_(named, CONFIG.STATUS_CONTRIB_ALIASES || []);
+  if (val) return val;
+
+  var ban = {};
+  ([]
+    .concat(CONFIG.STATUS_PROJECT_ALIASES || [], CONFIG.STATUS_STATUS_ALIASES || [],
+            ["Timestamp","Submission Time","Email","E-mail","Your email"]))
+    .forEach(function(k){ ban[String(k).toLowerCase()] = true; });
+
+  var best = "", bestLen = 0;
+  for (var k in named) if (named.hasOwnProperty(k)) {
+    var key = String(k || ""); var low = key.toLowerCase();
+    if (ban[low]) continue;
+    var arr = named[k]; var v = (arr && arr.length) ? String(arr[0]).trim() : "";
+    if (!v) continue;
+    if (v.length > bestLen) { best = v; bestLen = v.length; }
+  }
+  if (best) return best;
+
+  return getFromEventSheetRow_(e, CONFIG.STATUS_CONTRIB_ALIASES || []);
+}
+
+function getSpreadsheet_(e) {
+  if (CONFIG.TARGET_SPREADSHEET_ID) return SpreadsheetApp.openById(CONFIG.TARGET_SPREADSHEET_ID);
+  if (e && e.source) return e.source;
+  return SpreadsheetApp.getActive();
+}
+function findHeaderIndex_(headers, aliases) {
+  var want = (aliases || []).map(function(a){ return String(a || "").trim().toLowerCase(); });
+  for (var i = 0; i < headers.length; i++) {
+    var have = String(headers[i] || "").trim().toLowerCase();
+    if (want.indexOf(have) !== -1) return i;
+  }
+  return -1;
+}
+function getOrCreateHeaderIndex_(sheet, headerName) {
+  var lastCol = sheet.getLastColumn();
+  var headers = sheet.getRange(1,1,1,lastCol).getValues()[0] || [];
+  for (var i = 0; i < headers.length; i++) {
+    if (String(headers[i] || "").trim().toLowerCase() === String(headerName).trim().toLowerCase()) return i;
+  }
+  sheet.insertColumnAfter(lastCol);
+  var newCol = lastCol + 1;
+  sheet.getRange(1,newCol).setValue(headerName);
+  log_("INFO",'Created header "' + headerName + '" at column ' + newCol);
+  return newCol - 1;
+}
+function tryReadByHeader_(headers, rowValues, aliases) {
+  var i = findHeaderIndex_(headers, aliases);
+  return i === -1 ? "" : String(rowValues[i] || "").trim();
+}
+function normalize_(s, insensitive) {
+  var t = (s == null ? "" : String(s)).trim();
+  t = t.replace(/\u00A0/g, " ").replace(/\s+/g, " ");
+  return insensitive ? t.toLowerCase() : t;
+}
+function mergeContributors_(existing, incoming) {
+  var delim = CONFIG.CONTRIBUTORS_JOIN_DELIMITER || ", ";
+  var dedup = (CONFIG.CONTRIBUTORS_DEDUP !== false);
+  function explode(s) {
+    if (!s) return [];
+    return String(s).split(/,|;|\n|&|(?:\s+and\s+)/i).map(function(t){ return String(t || "").trim(); }).filter(function(t){ return t !== ""; });
+  }
+  var oldList = explode(existing);
+  var newList = explode(incoming);
+  if (!dedup) return (oldList.concat(newList)).join(delim);
+  var seen = {}, result = [];
+  oldList.forEach(function(v){ var k = normalize_(v, true); if (!seen[k]) { seen[k] = 1; result.push(v); }});
+  newList.forEach(function(v){ var k = normalize_(v, true); if (!seen[k]) { seen[k] = 1; result.push(v); }});
+  return result.join(delim);
+}
+function buildIntakeEmailHtml_(projectName, status, projectOwner, desc, headers, rowValues) {
+  var esc = function(s){ return (s == null ? "" : String(s)).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); };
+  var exclude = (CONFIG.EMAIL_EXCLUDE_HEADERS || []).map(function(h){ return String(h || "").trim().toLowerCase(); });
+
+  var core = [
+    '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">',
+    '<h2 style="margin:0 0 8px 0">New Project Submitted</h2>',
+    '<p><b>Project Name:</b> ' + esc(projectName) + '</p>',
+    '<p><b>Project Owner:</b> ' + esc(projectOwner) + '</p>',
+    '<p><b>Status:</b> ' + esc(status) + '</p>',
+    (desc ? '<p><b>Project Description:</b> ' + esc(desc).replace(/\n/g," ") + '</p>' : '')
+  ];
+
+  for (var i = 0; i < headers.length; i++) {
+    var h = String(headers[i] || "").trim(); if (!h) continue;
+    var normH = h.toLowerCase(); if (exclude.indexOf(normH) !== -1) continue;
+    var v = rowValues[i]; if (v === "" || v == null) continue;
+    core.push('<p><b>' + esc(h) + ':</b> ' + esc(v) + '</p>');
+  }
+  core.push('</div>');
+  return core.join("\n");
+}
+function shouldProcessEventOnce_(e, tag) {
+  var lock = LockService.getDocumentLock();
+  try {
+    lock.waitLock(10000);
+    var key = computeEventKey_(e, tag);
+    var props = PropertiesService.getDocumentProperties();
+    if (props.getProperty(key)) { lock.releaseLock(); return false; }
+    props.setProperty(key, String(new Date().getTime()));
+    lock.releaseLock();
+    return true;
+  } catch (err) {
+    try { lock.releaseLock(); } catch (_) {}
+    log_("WARN","shouldProcessEventOnce_ fallback: " + err);
+    return true;
+  }
+}
+function computeEventKey_(e, tag) {
+  var parts = ["RUNONCE", tag];
+  if (e && e.range) {
+    var sh = e.range.getSheet();
+    var sid = (sh && typeof sh.getSheetId === "function") ? sh.getSheetId() : (sh ? sh.getName() : "nosheet");
+    parts.push("S:" + sid, "R:" + (e.range.getRow() || 0));
+  }
+  var named = e && e.namedValues ? e.namedValues : {};
+  var ts = (named["Timestamp"] && named["Timestamp"][0]) || (named["Submission Time"] && named["Submission Time"][0]) || "";
+  if (ts) parts.push("TS:" + String(ts));
+  var pn = getFromNamedValues_(named, (CONFIG.STATUS_PROJECT_ALIASES || []).concat(CONFIG.PROJECT_HEADER_ALIASES || []));
+  if (pn) parts.push("PN:" + normalize_(pn, true));
+  if (parts.length < 4) {
+    var raw = JSON.stringify(named || {});
+    var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, raw);
+    var hex = digest.map(function(b){ var v=(b<0?b+256:b).toString(16); return v.length===1?"0"+v:v; }).join("");
+    parts.push("H:" + hex);
+  }
+  return parts.join("|");
+}
+function log_(level, message) {
+  try {
+    if (level === "ERROR") console.error(message);
+    else if (level === "WARN") console.warn(message);
+    else console.log(message);
+    if (!CONFIG.ENABLE_SHEET_LOGS) return;
+    var ss = getSpreadsheet_();
+    var sh = ss.getSheetByName(CONFIG.LOG_SHEET_NAME);
+    if (!sh) { sh = ss.insertSheet(CONFIG.LOG_SHEET_NAME); sh.getRange(1,1,1,4).setValues([["Timestamp","Level","Message","User"]]); }
+    sh.appendRow([new Date(), level, message, Session.getActiveUser().getEmail() || ""]);
+  } catch (_) {}
+}
